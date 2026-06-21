@@ -31,7 +31,7 @@ END_DATE = "2026-06-01"
 M_PATHS = 50000  
 
 # Exogenous Risk Constraints
-VAR_LIMIT_DOLLARS = 100         
+VAR_LIMIT_DOLLARS = 50         
 PORTFOLIO_VALUE = 600          
 CONFIDENCE_LEVEL = 0.99   # For VaR(99%) —Basel III Regulations—            
 
@@ -40,6 +40,7 @@ CONFIDENCE_LEVEL = 0.99   # For VaR(99%) —Basel III Regulations—
 # ==========================================
 
 def fetch_portfolio_returns(portfolio_dict, start_date, end_date):
+
     tickers = list(portfolio_dict.keys())
     weights = np.array(list(portfolio_dict.values()))
     
@@ -60,13 +61,21 @@ def fetch_portfolio_returns(portfolio_dict, start_date, end_date):
 # ==========================================
 
 def calculate_var_cvar(sim_returns, alpha):
+
+    # 1. Convert returns to losses (Profits become negative, losses become positive)
+    losses = -sim_returns
     
-    # Returns are transformed to positive numbers representing losses
-    sorted_returns = np.sort(-sim_returns) 
-    k = int(np.floor((1 - alpha) * len(sorted_returns)))
+    # 2. Sort from smallest to largest (Biggest losses go to the END of the array)
+    sorted_losses = np.sort(losses) 
     
-    var = sorted_returns[k]
-    cvar = np.mean(sorted_returns[:k])
+    # 3. Find the index for the tail cutoff (e.g., the 99% mark)
+    k = int(np.floor(alpha * len(sorted_losses)))
+    
+    # 4. VaR is the exact loss at the cutoff
+    var = sorted_losses[k]
+    
+    # 5. CVaR is the average of everything AFTER the cutoff (the worst scenarios)
+    cvar = np.mean(sorted_losses[k:])
     
     return var, cvar
 
@@ -98,15 +107,15 @@ def determine_optimal_beta(var_limit: float, compute_var_func: Callable[[float],
     
     # Using the bisection algorithm
 
-    beta_low = 0.1   
-    beta_high = 2.50  
+    beta_low = 1e-4   # Lowered floor so the algorithm can achieve very small limits (like $50)
+    beta_high = 3.5  
     
-    tol_beta = 1e-3   
-    tol_dollar = 100  
+    tol_beta = 1e-6   
+    tol_dollar = 1.5 
     
     error = float('inf')
     iterations = 0
-    max_iterations = 250 
+    max_iterations = 1000 
     
     while (beta_high - beta_low) > tol_beta and iterations < max_iterations:
         iterations += 1
@@ -162,8 +171,13 @@ if __name__ == "__main__":
         compute_var_func=optimize_target_wrapper
     )
     
-    print(f"Final Calculated Maximum Beta: {optimal_beta:.4f}")
+    print(f"Final Calculated Optimal Beta: {optimal_beta:.4f}")
     
     # Bonus: Show the CVaR at this exact Max Beta threshold
-    final_var, final_cvar = calculate_var_cvar(optimal_beta * base_sim_kde, alpha=0.975)
-    print(f"At Max Beta, CVaR (99%) is: {final_cvar*100:.2f}% (${final_cvar * PORTFOLIO_VALUE:,.2f})")
+    final_var_99, final_cvar_99 = calculate_var_cvar(optimal_beta * base_sim_kde, alpha=0.99)
+    final_var_975, final_cvar_975 = calculate_var_cvar(optimal_beta * base_sim_kde, alpha=0.975)
+    
+    print(f"At Optimal Beta, VaR (99%) is: {final_var_99*100:.2f}% (${final_var_99 * PORTFOLIO_VALUE:,.2f})")
+    print(f"At Optimal Beta, CVaR (99%) is: {final_cvar_99*100:.2f}% (${final_cvar_99 * PORTFOLIO_VALUE:,.2f})")
+    print(f"At Optimal Beta, VaR (97.5%) is: {final_var_975*100:.2f}% (${final_var_975 * PORTFOLIO_VALUE:,.2f})")
+    print(f"At Optimal Beta, CVaR (97.5%) is: {final_cvar_975*100:.2f}% (${final_cvar_975 * PORTFOLIO_VALUE:,.2f})")
