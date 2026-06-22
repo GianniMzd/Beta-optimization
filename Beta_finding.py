@@ -3,11 +3,17 @@
 
 # pyrefly: ignore [missing-import]
 import numpy as np
+import pandas as pd
 # pyrefly: ignore [missing-import]
 import scipy.stats as stats
 # pyrefly: ignore [missing-import]
+import scipy.optimize as optimize
+# pyrefly: ignore [missing-import]
 import yfinance as yf
-from typing import Callable
+# pyrefly: ignore [missing-import]
+import matplotlib.pyplot as plt
+# pyrefly: ignore [missing-import]
+import seaborn as sns
 
 # Set global seed for exact reproducibility across all random generations
 np.random.seed(42)
@@ -15,169 +21,266 @@ np.random.seed(42)
 # ==========================================
 # 1. USER CONFIGURATION & MANDATES
 # ==========================================
-
-# Define your assets and their corresponding weights here.
-# Ensure weights sum to 1.0
-
-PORTFOLIO = {
-    'AAPL': 0.40,  
-    'MSFT': 0.30,  
-    'GOOG': 0.20,  
-    'JPM': 0.10    
-}
+# Using the exact portfolio from your terminal
+TICKERS = ['TSLA', 'AIR.PA', 'GOOGL', 'AAPL', 'AF.PA', 'RACE.PA', 'BMW.DE', 'LVMH.PA', 'GLE.PA', 'GS', 'JPM', 'MSFT', 'GD', 'BA']
+BENCHMARK = '^GSPC'  # S&P 500 used to calculate the empirical Beta of each asset
 
 START_DATE = "2021-06-01"
 END_DATE = "2026-06-01"
 M_PATHS = 50000  
 
 # Exogenous Risk Constraints
-VAR_LIMIT_DOLLARS = 50         
-PORTFOLIO_VALUE = 600          
-CONFIDENCE_LEVEL = 0.99   # For VaR(99%) —Basel III Regulations—            
+VAR_LIMIT_DOLLARS = 50        
+PORTFOLIO_VALUE = 500          
+CONFIDENCE_LEVEL = 0.99           
+MAX_WEIGHT_PER_ASSET = 0.125 # Forces diversification (Max 23.5% in a single asset)
+MIN_WEIGHT_PER_ASSET = 0.01 # Forces diversification (Min 1.5% in a single asset)
 
 # ==========================================
-# 2. DATA ACQUISITION & PROCESSING
+# 2. DATA ACQUISITION & BETA CALCULATION
 # ==========================================
-
-def fetch_portfolio_returns(portfolio_dict, start_date, end_date):
-
-    tickers = list(portfolio_dict.keys())
-    weights = np.array(list(portfolio_dict.values()))
+def fetch_asset_and_benchmark_data(tickers, benchmark, start_date, end_date):
     
-    # Fetch historical daily close prices
-    data = yf.download(tickers, start=start_date, end=end_date)['Close']
-    data = data.dropna() 
+    #Fetches historical data, drops delisted/invalid tickers, and calculates the empirical Beta for each surviving asset.
+    all_tickers = tickers + [benchmark]
+    data = yf.download(all_tickers, start=start_date, end=end_date)['Close']
+    
+    # 1. Drop tickers that failed to download entirely (all NaNs)
+    data = data.dropna(axis=1, how='all')
+    
+    # 2. Identify which requested tickers actually survived
+    valid_tickers = [t for t in tickers if t in data.columns]
+    failed_tickers = set(tickers) - set(valid_tickers)
+    
+    if failed_tickers:
+        print(f"\n[WARNING] The following tickers failed to download and are excluded: {list(failed_tickers)}")
+        
+    # 3. Drop rows where any of the REMAINING valid assets are missing data
+    data = data.dropna(axis=0, how='any')
+    
+    if len(data) == 0:
+        raise ValueError("CRITICAL ERROR: No overlapping historical data found. Check your tickers.")
     
     # Calculate daily arithmetic returns
-    asset_returns = data.pct_change().dropna()
+    returns = data.pct_change().dropna()
     
-    # Generate the historical portfolio returns time series
-    historical_returns = asset_returns.dot(weights).to_numpy()
+    asset_returns = returns[valid_tickers]
+    benchmark_returns = returns[benchmark]
     
-    return historical_returns
+    # Calculate empirical Beta: Cov(R_i, R_m) / Var(R_m)
+    benchmark_var = benchmark_returns.var()
+    asset_betas = asset_returns.apply(lambda col: col.cov(benchmark_returns) / benchmark_var).to_numpy()
+    
+    print("\nEmpirical Asset Betas:")
+    for t, b in zip(valid_tickers, asset_betas):
+        print(f"  {t}: {b:.4f}")
+        
+    return asset_returns, benchmark_returns, asset_betas, valid_tickers
 
 # ==========================================
 # 3. RISK METRICS EVALUATION
 # ==========================================
-
 def calculate_var_cvar(sim_returns, alpha):
-
-    # 1. Convert returns to losses (Profits become negative, losses become positive)
+    
+    # Calculates empirical VaR and CVaR from the tail of the loss distribution
     losses = -sim_returns
-    
-    # 2. Sort from smallest to largest (Biggest losses go to the END of the array)
     sorted_losses = np.sort(losses) 
-    
-    # 3. Find the index for the tail cutoff (e.g., the 99% mark)
     k = int(np.floor(alpha * len(sorted_losses)))
     
-    # 4. VaR is the exact loss at the cutoff
     var = sorted_losses[k]
-    
-    # 5. CVaR is the average of everything AFTER the cutoff (the worst scenarios)
     cvar = np.mean(sorted_losses[k:])
-    
     return var, cvar
 
 # ==========================================
-# 4. MONTE CARLO SIMULATIONS
+# 4. DETERMINISTIC MONTE CARLO (KDE)
 # ==========================================
-
-def run_simulations(historical_returns, m_paths):
-
-    n_days = len(historical_returns)
+def run_simulations_deterministic(historical_returns, m_paths, random_indices, z_shocks):
     
-    # --- KERNEL DENSITY ESTIMATOR (KDE) ---
+    # Runs the KDE Smoothed Bootstrap using PRE-LOCKED random variables.
     kde = stats.gaussian_kde(historical_returns, bw_method='silverman')
     h = kde.factor * np.std(historical_returns)
     
-    # Hierarchical sampling for KDE
-    random_indices = np.random.choice(n_days, size=m_paths, replace=True)
     xi = historical_returns[random_indices]
-    z = np.random.normal(0, 1, m_paths)
-    sim_returns_kde = xi + h * z
-    
+    sim_returns_kde = xi + h * z_shocks
     return sim_returns_kde
 
 # ==========================================
 # 5. MAX BETA OPTIMIZATION ENGINE
 # ==========================================
-
-def determine_optimal_beta(var_limit: float, compute_var_func: Callable[[float], float]) -> float:
+def maximize_portfolio_beta(asset_returns_df, asset_betas):
     
-    # Using the bisection algorithm
-
-    beta_low = 1e-4   # Lowered floor so the algorithm can achieve very small limits (like $50)
-    beta_high = 3.5  
+    # The multi-dimensional solver. Maximizes Beta subject to the KDE VaR limit
+    n_assets = len(asset_betas)
+    n_days = len(asset_returns_df)
     
-    tol_beta = 1e-6   
-    tol_dollar = 1.5 
+    print(f"\nPre-generating {M_PATHS} random shocks to lock the KDE surface...")
+    locked_indices = np.random.choice(n_days, size=M_PATHS, replace=True)
+    locked_z_shocks = np.random.normal(0, 1, M_PATHS)
     
-    error = float('inf')
-    iterations = 0
-    max_iterations = 1000 
+    # OBJECTIVE: Maximize Portfolio Beta 
+    def objective_function(weights):
+        portfolio_beta = np.dot(weights, asset_betas)
+        return -portfolio_beta 
     
-    while (beta_high - beta_low) > tol_beta and iterations < max_iterations:
-        iterations += 1
-        beta_mid = (beta_low + beta_high) / 2.0
-        
-        # Call the wrapper function for the current guess
-        var_sim = compute_var_func(beta_mid)
-        error = var_sim - var_limit
-        
-        if abs(error) < tol_dollar:
-            break
-        elif error > 0:
-            beta_high = beta_mid  # Too Risky
-        else:
-            beta_low = beta_mid   # Too Conservative
-            
-    return (beta_low + beta_high) / 2.0
-
-# ==========================================
-# 6. EXECUTION 
-# ==========================================
-
-if __name__ == "__main__":
-    
-    # 1. Fetch Data
-    hist_returns = fetch_portfolio_returns(PORTFOLIO, START_DATE, END_DATE)
-    
-    # 2. Simulate 50,000 paths ONCE to establish the base benchmark tail
-    base_sim_kde = run_simulations(hist_returns, M_PATHS)
-    
-    # 3. Print the base benchmark metrics (Beta = 1.0)
-    base_var, base_cvar = calculate_var_cvar(base_sim_kde, alpha=CONFIDENCE_LEVEL)
-    print(f"Base Portfolio VaR (99%): {base_var*100:.2f}% (${base_var * PORTFOLIO_VALUE:,.2f})")
-    print("-" * 60)
-
-    # 4. Define the specific Wrapper for the optimizer
-    def optimize_target_wrapper(beta_guess: float) -> float:
-
-        # Scale the simulated benchmark returns by Beta
-        scaled_sim_returns = beta_guess * base_sim_kde
-        
-        # Feed into your specific risk function
-        var_pct, cvar_pct = calculate_var_cvar(scaled_sim_returns, alpha=CONFIDENCE_LEVEL)
-        
-        # Your function already returns a positive percentage (e.g., 0.045 for a 4.5% loss)
-        # Convert it to absolute dollars
+    # CONSTRAINT: KDE VaR must be <= Target Limit
+    def var_constraint(weights):
+        port_hist_returns = asset_returns_df.dot(weights).to_numpy()
+        sim_p = run_simulations_deterministic(port_hist_returns, M_PATHS, locked_indices, locked_z_shocks)
+        var_pct, _ = calculate_var_cvar(sim_p, alpha=CONFIDENCE_LEVEL)
         var_dollar = PORTFOLIO_VALUE * var_pct
-        return var_dollar
+        return VAR_LIMIT_DOLLARS - var_dollar
 
-    # 5. Execute the Optimization
-    optimal_beta = determine_optimal_beta(
-        var_limit=VAR_LIMIT_DOLLARS, 
-        compute_var_func=optimize_target_wrapper
+    sum_constraint = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}
+    risk_constraint = {'type': 'ineq', 'fun': var_constraint}
+    
+    bounds = tuple((MIN_WEIGHT_PER_ASSET, MAX_WEIGHT_PER_ASSET) for _ in range(n_assets))
+    initial_weights = np.array([1/n_assets] * n_assets)
+    
+    print("Executing SLSQP solver to maximize Beta under VaR constraint...\n")
+    result = optimize.minimize(
+        objective_function, 
+        initial_weights, 
+        method='SLSQP', 
+        bounds=bounds, 
+        constraints=[sum_constraint, risk_constraint],
+        options={'disp': True, 'ftol': 1e-6}
     )
     
-    print(f"Final Calculated Optimal Beta: {optimal_beta:.4f}")
+    return result.x, locked_indices, locked_z_shocks
+
+# ==========================================
+# 6. VISUALIZATION EXPORT
+# ==========================================
+def export_visualizations(optimal_weights, tickers, final_sim_returns, var_limit, port_value, asset_betas, asset_returns, benchmark_returns, alpha=0.99):
     
-    # Bonus: Show the CVaR at this exact Max Beta threshold
-    final_var_99, final_cvar_99 = calculate_var_cvar(optimal_beta * base_sim_kde, alpha=0.99)
-    final_var_975, final_cvar_975 = calculate_var_cvar(optimal_beta * base_sim_kde, alpha=0.975)
+    # Generates and exports a 2x2 quantitative dashboard showing allocation, risk metrics, beta contributions, and historical performance.
+    print("\nGenerating 2x2 Quantitative Dashboard...")
+    sns.set_theme(style="whitegrid")
+    fig, axes = plt.subplots(2, 2, figsize=(20, 14))
+    fig.suptitle("KDE Maximum Beta Optimization & Risk Dashboard", fontsize=18, fontweight='bold', y=0.95)
     
-    print(f"At Optimal Beta, VaR (99%) is: {final_var_99*100:.2f}% (${final_var_99 * PORTFOLIO_VALUE:,.2f})")
-    print(f"At Optimal Beta, CVaR (99%) is: {final_cvar_99*100:.2f}% (${final_cvar_99 * PORTFOLIO_VALUE:,.2f})")
-    print(f"At Optimal Beta, VaR (97.5%) is: {final_var_975*100:.2f}% (${final_var_975 * PORTFOLIO_VALUE:,.2f})")
-    print(f"At Optimal Beta, CVaR (97.5%) is: {final_cvar_975*100:.2f}% (${final_cvar_975 * PORTFOLIO_VALUE:,.2f})")
+    # Filter out near-zero weights for cleaner charts
+    mask = optimal_weights > 0.001
+    filtered_weights = optimal_weights[mask]
+    filtered_tickers = np.array(tickers)[mask]
+    filtered_betas = asset_betas[mask]
+    
+    # -------------------------------------------------------------
+    # Panel 1 (Top-Left): Optimal Portfolio Allocation
+    # -------------------------------------------------------------
+    colors = sns.color_palette("viridis", len(filtered_tickers))
+    axes[0, 0].pie(filtered_weights, labels=filtered_tickers, autopct='%1.1f%%', 
+                   startangle=140, colors=colors, textprops={'fontsize': 11})
+    axes[0, 0].set_title("Optimal Weight Allocation", fontweight='bold', fontsize=14)
+    
+    # -------------------------------------------------------------
+    # Panel 2 (Top-Right): Weighted Beta Contribution
+    # -------------------------------------------------------------
+    weighted_betas = filtered_weights * filtered_betas
+    total_beta = np.sum(weighted_betas)
+    
+    sns.barplot(x=filtered_tickers, y=weighted_betas, ax=axes[0, 1], palette="magma")
+    axes[0, 1].set_title(f"Marginal Beta Contribution (Total Portfolio $\\beta$ = {total_beta:.3f})", fontweight='bold', fontsize=14)
+    axes[0, 1].set_ylabel("Weighted Beta ($w_i \\times \\beta_i$)")
+    axes[0, 1].axhline(0, color='black', linewidth=1)
+    
+    # Annotate bars with exact numbers
+    for i, p in enumerate(axes[0, 1].patches):
+        axes[0, 1].annotate(f"{weighted_betas[i]:.3f}", 
+                            (p.get_x() + p.get_width() / 2., p.get_height()), 
+                            ha='center', va='bottom', fontsize=10, xytext=(0, 5), 
+                            textcoords='offset points')
+
+    # -------------------------------------------------------------
+    # Panel 3 (Bottom-Left): KDE Loss Distribution & Risk Thresholds
+    # -------------------------------------------------------------
+    monetary_losses = -final_sim_returns * port_value
+    sorted_losses = np.sort(monetary_losses)
+    k = int(np.floor(alpha * len(sorted_losses)))
+    var_dollar = sorted_losses[k]
+    cvar_dollar = np.mean(sorted_losses[k:])
+    
+    sns.histplot(monetary_losses, bins=100, kde=True, ax=axes[1, 0], color="steelblue", 
+                 stat="density", linewidth=0, alpha=0.4)
+    
+    axes[1, 0].axvline(x=var_dollar, color='orange', linestyle='--', linewidth=2.5, 
+                       label=f'Achieved VaR (99%): ${var_dollar:,.2f}')
+    axes[1, 0].axvline(x=cvar_dollar, color='red', linestyle='-', linewidth=2.5, 
+                       label=f'CVaR (Expected Shortfall): ${cvar_dollar:,.2f}')
+    axes[1, 0].axvline(x=var_limit, color='black', linestyle=':', linewidth=2.5, 
+                       label=f'Hard Regulatory Limit: ${var_limit:,.2f}')
+    
+    axes[1, 0].set_title("Simulated KDE Tail Loss Distribution", fontweight='bold', fontsize=14)
+    axes[1, 0].set_xlabel(f"Monetary Loss on ${port_value:,.2f} Portfolio")
+    axes[1, 0].set_ylabel("Probability Density")
+    axes[1, 0].legend(loc='upper right')
+    axes[1, 0].set_xlim(np.percentile(monetary_losses, 50), max(var_limit * 1.5, cvar_dollar * 1.2))
+
+    # -------------------------------------------------------------
+    # Panel 4 (Bottom-Right): In-Sample Historical Trajectory
+    # -------------------------------------------------------------
+    # Calculate historical trajectory of the optimal portfolio
+    port_hist_returns = asset_returns.dot(optimal_weights)
+    cum_port = (1 + port_hist_returns).cumprod() - 1
+    cum_bench = (1 + benchmark_returns).cumprod() - 1
+    
+    axes[1, 1].plot(cum_port.index, cum_port * 100, label='Optimized Portfolio', color='indigo', linewidth=2)
+    axes[1, 1].plot(cum_bench.index, cum_bench * 100, label='S&P 500 Benchmark', color='gray', linestyle='--', linewidth=1.5)
+    
+    axes[1, 1].set_title("Historical Trajectory vs Benchmark", fontweight='bold', fontsize=14)
+    axes[1, 1].set_ylabel("Cumulative Return (%)")
+    axes[1, 1].axhline(0, color='black', linewidth=1)
+    axes[1, 1].legend(loc='upper left')
+    
+    # Format dates nicely
+    fig.autofmt_xdate()
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    file_name = "portfolio_risk_dashboard.png"
+    plt.savefig(file_name, dpi=300, bbox_inches='tight')
+    print(f"[SUCCESS] High-resolution quantitative dashboard exported as '{file_name}'")
+
+# ==========================================
+# 7. EXECUTION 
+# ==========================================
+if __name__ == "__main__":
+    
+    # 1. Fetch data and calculate empirical betas (Handles failed tickers)
+    asset_returns, benchmark_returns, asset_betas, valid_tickers = fetch_asset_and_benchmark_data(TICKERS, BENCHMARK, START_DATE, END_DATE)
+    
+    # 2. Run the Optimization
+    optimal_weights, locked_idx, locked_z = maximize_portfolio_beta(asset_returns, asset_betas)
+    
+    # 3. Print the optimal reallocation
+    print("\n" + "=" * 60)
+    print("MAX BETA PORTFOLIO ALLOCATION (RISK-BUDGETING)")
+    print("=" * 60)
+    for ticker, weight in zip(valid_tickers, optimal_weights):
+        print(f"{ticker:<5}: {weight*100:>6.2f}%")
+        
+    print("-" * 60)
+    
+    # 4. Verify the final metrics of this newly allocated portfolio
+    final_hist_returns = asset_returns.dot(optimal_weights).to_numpy()
+    final_sim = run_simulations_deterministic(final_hist_returns, M_PATHS, locked_idx, locked_z)
+    
+    final_var_99, final_cvar_99 = calculate_var_cvar(final_sim, alpha=0.99)
+    achieved_beta = np.dot(optimal_weights, asset_betas)
+    
+    print(f"Maximized Portfolio Beta   : {achieved_beta:.4f}")
+    print(f"Final Simulated VaR (99%)  : {final_var_99*100:.2f}% (${final_var_99 * PORTFOLIO_VALUE:,.2f})")
+    print(f"Final Simulated CVaR (99%) : {final_cvar_99*100:.2f}% (${final_cvar_99 * PORTFOLIO_VALUE:,.2f})")
+    print("=" * 60)
+    
+    # 5. Export Visualizations
+    export_visualizations(
+        optimal_weights=optimal_weights,
+        tickers=valid_tickers,
+        final_sim_returns=final_sim,
+        var_limit=VAR_LIMIT_DOLLARS,
+        port_value=PORTFOLIO_VALUE,
+        asset_betas=asset_betas,
+        asset_returns=asset_returns,
+        benchmark_returns=benchmark_returns,
+        alpha=CONFIDENCE_LEVEL
+    )
